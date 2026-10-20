@@ -141,7 +141,7 @@ class SocialQueryClient:
             raise SocialQueryError("Mutating requests require an idempotency key for safe deliberate retries.")
         if not isinstance(parameters, dict):
             raise SocialQueryError("Parameters must be an object.")
-        cost = endpoint.get("creditCost")
+        cost = 0 if endpoint.get("path") == "/v1/jobs/bing/search" and isinstance(parameters.get("cursor"), str) and re.fullmatch(r"bsw1_[A-Za-z0-9_-]{100,2043}", parameters["cursor"]) else endpoint.get("creditCost")
         pricing = endpoint.get("creditPricing")
         resolved_pricing = isinstance(pricing, dict) and pricing.get("type") == "resolved_endpoint"
         if resolved_pricing:

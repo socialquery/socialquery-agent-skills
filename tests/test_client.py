@@ -18,6 +18,17 @@ class Opener:
         return io.BytesIO(json.dumps({"success":True,"credits_used":0,"data":{"endpoints":[self.endpoint]}}).encode())
 
 class ClientTests(unittest.TestCase):
+    def test_bing_snapshot_continuation_quotes_zero(self):
+        item={**ENDPOINT,"path":"/v1/jobs/bing/search","creditCost":10,"params":[{"name":"query"},{"name":"location"},{"name":"cursor"}],"oneOfParameters":[["query","cursor"],["location","cursor"]]}
+        opener=Opener(item); client=module.SocialQueryClient("sq_test",opener=opener)
+        for params in [{"query":"engineer","location":"London"},{"cursor":"malformed"}]:
+            with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],params,0)
+        self.assertFalse(any(item["path"] in r.full_url for r in opener.requests))
+        cursor="bsw1_"+"a"*120
+        client.call_endpoint(item["id"],{"cursor":cursor},0)
+        self.assertEqual(opener.requests[-1].get_header("X-max-credits"),"0")
+        self.assertIn(cursor,opener.requests[-1].full_url)
+
     def test_linkedin_profile_csv_batch_holds(self):
         pricing={"type":"linkedin_profile_urls","maxItems":10,"creditsPerProfile":5}
         item={**ENDPOINT,"path":"/v1/linkedin/profile/all","creditPricing":pricing,"params":[{"name":"url"},{"name":"urls"}],"oneOfParameters":[["url","urls"]]}

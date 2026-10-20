@@ -32,6 +32,8 @@ Balance and transaction reads are free and private. Transactions use an opaque `
 
 Discovery needs no key. Data requests and balance require `SOCIALQUERY_API_KEY` in the process environment. If missing, direct the user to create a key in their dashboard and store it in their local secret configuration. Never ask them to paste it into chat. The helper sends credentials only to SocialQuery and rejects redirects. Read [operations](references/operations.md) for error and parameter details.
 
+For a user-requested background job, an optional `webhook: {"url":"https://hooks.example.com/events"}` is staged behind a disabled release gate. Use only a destination supplied or approved by the user. The initial 202 returns a one-time signing secret; preserve it in approved secret storage and omit it from reports. Replays and job reads do not return it again. Callback delivery follows durable settlement, adds no customer charge and never retries automatically; inspect `webhook_delivery` and poll results after uncertain delivery. Posts enrichment remains unsupported.
+
 ## Report evidence
 
 Use `structuredContent.result` for the full MCP result; the text preview can be truncated. Preserve source URLs, identifiers, observation time, request ID, cache state, and returned warnings. Distinguish reported platform metrics from your calculations. Public search results are a sample, not an exhaustive census; missing values are not zero.

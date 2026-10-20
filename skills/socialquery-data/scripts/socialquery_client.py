@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +14,44 @@ MAX_BYTES = 4 * 1024 * 1024
 
 class SocialQueryError(Exception):
     pass
+
+
+def _linkedin_profile_url(value):
+    if not isinstance(value, str) or len(value) > 1240 or re.search(r"[\x00-\x20\x7f]", value):
+        raise SocialQueryError("Invalid LinkedIn profile URL.")
+    match = re.fullmatch(r"https://(?:www\.)?linkedin\.com/in/([^/?#]+)/?", value)
+    if not match or len(match[1]) > 1200:
+        raise SocialQueryError("Invalid LinkedIn profile URL.")
+    try:
+        decoded = urllib.parse.unquote(match[1], encoding="utf-8", errors="strict")
+        encoded = urllib.parse.quote(decoded, safe="-_")
+    except (ValueError, UnicodeError):
+        raise SocialQueryError("Invalid LinkedIn profile URL.") from None
+    if len(decoded) > 100 or any(ch not in "_-" and unicodedata.category(ch)[0] not in "LMN" for ch in decoded) or match[1] not in (decoded, encoded):
+        raise SocialQueryError("Invalid LinkedIn profile URL.")
+    return "https://www.linkedin.com/in/" + encoded
+
+
+def _job_webhook(value):
+    if not isinstance(value, dict) or set(value) != {"url"}:
+        raise SocialQueryError("webhook must contain only a public HTTPS url.")
+    raw = value["url"]
+    if not isinstance(raw, str) or len(raw) > 2048 or re.search(r"[^\x21-\x7e]", raw) or "#" in raw:
+        raise SocialQueryError("Invalid public HTTPS webhook URL.")
+    if re.search(r"[<>\"'`{}\\^|]", raw) or re.search(r"%(?![a-fA-F0-9]{2})", raw):
+        raise SocialQueryError("Use canonical URL escapes.")
+    match = re.match(r"https://([a-z0-9.-]+)(?:[/?]|$)", raw)
+    try:
+        url = urllib.parse.urlsplit(raw)
+        if not match or match[1] != url.hostname or url.scheme != "https" or url.username or url.password or url.port or url.fragment:
+            raise ValueError()
+        if len(urllib.parse.urlunsplit((url.scheme, url.netloc, url.path or "/", url.query, ""))) > 2048 or any(part.lower() in (".","..","%2e",".%2e","%2e.","%2e%2e") for part in url.path.split("/")):
+            raise ValueError()
+        labels = url.hostname.split(".")
+        if len(url.hostname) > 253 or len(labels) < 2 or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels) or not re.fullmatch(r"[a-z]{2,63}", labels[-1]) or labels[-1] in ("localhost","local","internal","lan","home","corp","onion","invalid","test","arpa"):
+            raise ValueError()
+    except ValueError:
+        raise SocialQueryError("Invalid public HTTPS webhook URL.") from None
 
 
 class NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -61,17 +100,18 @@ class SocialQueryClient:
             headers["Content-Type"] = "application/json"
             body = json.dumps(parameters or {}, allow_nan=False).encode()
         request = urllib.request.Request(url, headers=headers, method=method, data=body)
+        maximum = 6 * 1024 * 1024 + 8192 if path == "/v1/linkedin/profile/all" else MAX_BYTES + 8192 if path == "/v1/linkedin/profile/complete" else MAX_BYTES
         try:
             with self.opener.open(request, timeout=60) as response:
-                raw = response.read(MAX_BYTES + 1)
+                raw = response.read(maximum + 1)
         except urllib.error.HTTPError as error:
             request_id = re.sub(r"[^A-Za-z0-9_-]", "", error.headers.get("x-request-id", "unavailable"))[:100]
             error.close()
             raise SocialQueryError(f"SocialQuery HTTP {error.code}; request ID: {request_id}. No automatic retry was made.") from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise SocialQueryError("SocialQuery request failed or timed out. No automatic retry was made.") from None
-        if len(raw) > MAX_BYTES:
-            raise SocialQueryError("API response exceeds 4 MiB. Narrow the query or page size.")
+        if len(raw) > maximum:
+            raise SocialQueryError("API response exceeds the endpoint size limit. Narrow the query or page size.")
         try:
             result = json.loads(raw)
         except (ValueError, UnicodeError):
@@ -109,12 +149,153 @@ class SocialQueryClient:
                 raise SocialQueryError("Invalid resolved pricing metadata.")
             cost = pricing["maxCredits"]
         elif isinstance(pricing, dict) and pricing.get("type") == "boolean_option":
-            if endpoint.get("path") != "/v1/tiktok/comment" or pricing.get("parameter") != "deep_scan" or type(pricing.get("defaultCredits")) is not int or pricing["defaultCredits"] != 2 or type(pricing.get("enabledCredits")) is not int or pricing["enabledCredits"] != 6:
-                raise SocialQueryError("Invalid comment-lookup pricing metadata.")
-            raw = parameters.get("deep_scan")
-            if "deep_scan" in parameters and not (type(raw) is bool or type(raw) is str and raw in ("true", "false")):
-                raise SocialQueryError("deep_scan must be true or false.")
-            cost = 6 if raw is True or raw == "true" else 2
+            expected = {"/v1/tiktok/comment": (2, 6, "deep_scan"), "/v1/instagram/comment": (5, 15, "deep_scan"), "/v1/prism/crisis-radar": (15, 45, "confirm")}.get(endpoint.get("path"))
+            if expected is None or pricing.get("parameter") != expected[2] or type(pricing.get("defaultCredits")) is not int or pricing["defaultCredits"] != expected[0] or type(pricing.get("enabledCredits")) is not int or pricing["enabledCredits"] != expected[1]:
+                raise SocialQueryError("Invalid boolean-option pricing metadata.")
+            raw = parameters.get(expected[2])
+            if expected[2] in parameters and not (type(raw) is bool or type(raw) is str and raw in ("true", "false")):
+                raise SocialQueryError(f"{expected[2]} must be true or false.")
+            cost = expected[1] if raw is True or raw == "true" else expected[0]
+        elif isinstance(pricing, dict) and pricing.get("type") == "returned_rows":
+            expected_max = 25 if endpoint.get("path") in ("/v1/douyin/search", "/v1/douyin/profile/posts", "/v1/douyin/search/users") else 20 if endpoint.get("path") in ("/v1/xiaohongshu/search", "/v1/xiaohongshu/profile/posts", "/v1/xiaohongshu/trending") else None
+            if expected_max is None or endpoint.get("method") != "GET" or pricing.get("limitParameter") != "limit" or any(type(pricing.get(k)) is not int or pricing[k] != v for k,v in {"creditsPerItem":5,"defaultLimit":10,"maxLimit":expected_max,"maxCredits":expected_max*5}.items()):
+                raise SocialQueryError("Invalid returned-row pricing metadata.")
+            raw = parameters.get("limit", 10)
+            if type(raw) not in (str,int) or not re.fullmatch(r"[1-9][0-9]?", str(raw)) or int(raw) > expected_max:
+                raise SocialQueryError(f"limit must be a canonical integer from 1 to {expected_max}.")
+            cost = int(raw) * 5
+        elif isinstance(pricing, dict) and pricing.get("type") == "reddit_omni":
+            if endpoint.get("path") != "/v1/reddit/omni-search" or endpoint.get("method") != "GET" or any(type(pricing.get(k)) is not int or pricing[k] != v for k,v in {"baseCredits":1,"minimumCredits":5,"defaultThreads":8,"maxThreads":8,"maxCredits":9}.items()):
+                raise SocialQueryError("Invalid Reddit Omni pricing metadata.")
+            query, threads, raw = parameters.get("query"), parameters.get("threads", 8), parameters.get("include", "subreddits,comments")
+            if not isinstance(query, str) or not query.strip() or len(query.encode("utf-16-le")) // 2 > 500 or re.search(r"[\x00-\x1f\x7f]", query) or type(threads) not in (int,str) or not re.fullmatch(r"[1-8]", str(threads)) or not isinstance(raw, str):
+                raise SocialQueryError("Invalid Reddit Omni query, threads or include.")
+            include = [s.strip() for s in raw.split(",")]
+            if not include or len(set(include)) != len(include) or any(s not in ("subreddits", "comments") for s in include):
+                raise SocialQueryError("Invalid Reddit Omni include.")
+            cost = max(5, 1 + (int(threads) if "comments" in include else 0))
+        elif isinstance(pricing, dict) and pricing.get("type") == "korea_gap":
+            if endpoint.get("path") != "/v1/prism/korea-gap" or type(pricing.get("defaultCredits")) is not int or pricing["defaultCredits"] != 40 or type(pricing.get("webOnlyCredits")) is not int or pricing["webOnlyCredits"] != 15:
+                raise SocialQueryError("Invalid Korea Gap pricing metadata.")
+            raw = parameters.get("include")
+            if "include" in parameters and not isinstance(raw, str):
+                raise SocialQueryError("include must be a CSV string.")
+            include = ["social", "quotes"] if raw is None else [] if raw == "" else [v.strip() for v in raw.split(",")]
+            if len(set(include)) != len(include) or any(v not in ("social", "quotes") for v in include):
+                raise SocialQueryError("include accepts social and quotes only.")
+            query = parameters.get("query")
+            if not isinstance(query, str) or not query.strip() or len(query.strip().encode("utf-16-le")) // 2 > 500 or re.search(r"[\x00-\x1f\x7f]", query):
+                raise SocialQueryError("query must be 1–500 plain-text characters.")
+            cost = 40 if "social" in include else 15
+        elif isinstance(pricing, dict) and pricing.get("type") == "store_reviews":
+            if endpoint.get("path") != "/v1/prism/app-reviews" or type(pricing.get("singleStoreCredits")) is not int or pricing["singleStoreCredits"] != 10 or type(pricing.get("bothStoresCredits")) is not int or pricing["bothStoresCredits"] != 15:
+                raise SocialQueryError("Invalid store-review pricing metadata.")
+            stores = ["google_play", "app_store"]
+            query = parameters.get("query")
+            if "query" in parameters and (not isinstance(query, str) or not query.strip() or len(query.encode("utf-16-le")) // 2 > 200 or re.search(r"[\x00-\x1f\x7f]", query)):
+                raise SocialQueryError("Invalid review search query.")
+            if "stores" in parameters and not isinstance(parameters["stores"], str):
+                raise SocialQueryError("Invalid review stores.")
+            selected = ([v.strip() for v in parameters["stores"].split(",")] if "stores" in parameters else stores if query else [v for v in stores if v + "_id" in parameters])
+            if not selected or len(selected) > 2 or len(set(selected)) != len(selected) or any(v not in stores for v in selected) or any(v + "_id" in parameters and v not in selected for v in stores):
+                raise SocialQueryError("Invalid review stores.")
+            for store in selected:
+                field = store + "_id"
+                if field not in parameters:
+                    if not query:
+                        raise SocialQueryError("Supply selected store IDs or a review search query.")
+                elif not isinstance(parameters[field], str) or not parameters[field].strip():
+                    raise SocialQueryError("Supply selected store IDs or a review search query.")
+            cost = 10 if len(selected) == 1 else 15
+        elif isinstance(pricing, dict) and pricing.get("type") == "group_search":
+            expected = {"baseCredits": 1, "creditsPerGroup": 1, "maxGroups": 10, "maxCredits": 11}
+            if endpoint.get("path") != "/v1/facebook/search/groups" or any(type(pricing.get(k)) is not int or pricing[k] != v for k, v in expected.items()):
+                raise SocialQueryError("Invalid group-search pricing metadata.")
+            query = parameters.get("query")
+            if not isinstance(query, str) or not query.strip() or len(query.strip().encode("utf-16-le")) // 2 > 200 or re.search(r"[\x00-\x1f\x7f]", query) or re.search(r"\bsite\s*:", query, re.I):
+                raise SocialQueryError("Invalid group-search query.")
+            if "include" in parameters and parameters["include"] != "details":
+                raise SocialQueryError("include accepts details only.")
+            if "page" in parameters and (type(parameters["page"]) not in (int, str) or not re.fullmatch(r"[1-9][0-9]*", str(parameters["page"])) or int(parameters["page"]) > 100):
+                raise SocialQueryError("page must be 1–100.")
+            if "cursor" in parameters and ("page" in parameters or not isinstance(parameters["cursor"], str) or len(parameters["cursor"]) > 8000 or not re.fullmatch(r"fbgs1_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", parameters["cursor"])):
+                raise SocialQueryError("Invalid group-search cursor.")
+            cost = 11 if parameters.get("include") == "details" else 1
+        elif isinstance(pricing, dict) and pricing.get("type") == "comment_leads":
+            expected = {"defaultPosts": 30, "maxPosts": 90, "defaultOpen": 12, "maxOpen": 20, "defaultComments": 50, "maxComments": 200, "postsPerPage": 30, "commentsPerPage": 50, "labelsPerCredit": 25, "maxCredits": 243}
+            if endpoint.get("path") != "/v1/prism/comment-leads" or any(type(pricing.get(k)) is not int or pricing[k] != v for k, v in expected.items()):
+                raise SocialQueryError("Invalid comment-leads pricing metadata.")
+            values = []
+            for name, fallback, maximum in [("posts", 30, 90), ("open", 12, 20), ("comments_per_post", 50, 200)]:
+                raw = parameters.get(name, fallback)
+                if type(raw) not in (int, str) or not re.fullmatch(r"[1-9][0-9]*", str(raw)) or int(raw) > maximum:
+                    raise SocialQueryError(f"{name} is outside its supported range.")
+                values.append(int(raw))
+            for name, maximum in [("query", 100), ("offer", 300)]:
+                value = parameters.get(name, parameters.get("query") if name == "offer" else None)
+                if not isinstance(value, str) or not value.strip() or len(value.strip().encode("utf-16-le")) // 2 > maximum or re.search(r"[\x00-\x1f\x7f]", value):
+                    raise SocialQueryError(f"Invalid {name}.")
+            if "platform" in parameters and parameters["platform"] != "tiktok" or "include" in parameters and parameters["include"] != "askers":
+                raise SocialQueryError("Invalid Comment Leads platform or include.")
+            posts, opened, comments = values
+            cost = (posts + 29) // 30 + opened * ((comments + 49) // 50 + (comments + 24) // 25)
+        elif isinstance(pricing, dict) and pricing.get("type") == "investigation_budget":
+            expected = {"defaultBudget": 40, "maxBudget": 200, "maxSteps": 12}
+            if endpoint.get("path") != "/v1/prism/investigate" or any(type(pricing.get(k)) is not int or pricing[k] != v for k, v in expected.items()):
+                raise SocialQueryError("Invalid investigation pricing metadata.")
+            raw, steps = parameters.get("budget", 40), parameters.get("max_steps", 8)
+            for value, limit, name in [(raw, 200, "budget"), (steps, 12, "max_steps")]:
+                if type(value) not in (int, str) or not re.fullmatch(r"[1-9][0-9]*", str(value)) or int(value) > limit:
+                    raise SocialQueryError(f"{name} must be 1–{limit}.")
+            goal = parameters.get("goal")
+            if not isinstance(goal, str) or not goal.strip() or len(goal.strip()) > 500 or re.search(r"[\x00-\x1f\x7f]", goal):
+                raise SocialQueryError("goal must be 1–500 plain-text characters.")
+            cost = int(raw)
+        elif isinstance(pricing, dict) and pricing.get("type") == "profile_hydration":
+            expected = {"baseCredits": 5, "creditsPerProfile": 1, "defaultLimit": 20, "maxLimit": 80}
+            if endpoint.get("path") != "/v1/instagram/similar" or any(type(pricing.get(k)) is not int or pricing[k] != v for k, v in expected.items()):
+                raise SocialQueryError("Invalid profile enrichment pricing metadata.")
+            include = parameters.get("include")
+            if "include" in parameters and include != "profile": raise SocialQueryError("include accepts only profile.")
+            raw = parameters.get("limit", 20 if include == "profile" else 80)
+            if type(raw) not in (int, str) or not re.fullmatch(r"[1-9][0-9]?", str(raw)) or int(raw) > 80:
+                raise SocialQueryError("limit must be 1–80.")
+            cost = 5 + (int(raw) if include == "profile" else 0)
+        elif isinstance(pricing, dict) and pricing.get("type") == "org_repositories":
+            expected = {"baseCredits": 1, "creditsPerRepo": 5, "defaultRepos": 5, "maxRepos": 10}
+            if endpoint.get("path") != "/v1/prism/org-radar" or any(type(pricing.get(k)) is not int or pricing[k] != v for k, v in expected.items()):
+                raise SocialQueryError("Invalid organization pricing metadata.")
+            raw = parameters.get("repos", 5)
+            if type(raw) not in (int, str) or not re.fullmatch(r"(?:[1-9]|10)", str(raw)):
+                raise SocialQueryError("repos must be an integer from 1 to 10.")
+            include = parameters.get("include", "dossiers,rollup")
+            if not isinstance(include, str): raise SocialQueryError("Invalid organization include.")
+            parts = [x.strip() for x in include.split(",")]
+            if any(x not in ("dossiers", "rollup") for x in parts) or len(set(parts)) != len(parts):
+                raise SocialQueryError("Invalid organization include.")
+            cost = 1 + (5 * int(raw) if "dossiers" in parts else 0)
+        elif isinstance(pricing, dict) and pricing.get("type") == "enriched_reel_pages":
+            expected = {"creditsPerPage": 5, "pageSize": 10, "maxLimit": 50}
+            if endpoint.get("path") != "/v1/facebook/profile/reels/full" or any(type(pricing.get(k)) is not int or pricing[k] != v for k, v in expected.items()):
+                raise SocialQueryError("Invalid enriched reel pricing metadata.")
+            raw = parameters.get("limit", 10)
+            if type(raw) not in (int, str) or isinstance(raw, str) and not re.fullmatch(r"[1-9][0-9]*", raw) or not 1 <= int(raw) <= 50:
+                raise SocialQueryError("limit must be an integer from 1 to 50.")
+            cost = ((int(raw) + 9) // 10) * 5
+        elif isinstance(pricing, dict) and pricing.get("type") == "creator_card":
+            expected = {"baseCredits": 5, "includedPlatforms": 4, "extraPlatformCredits": 1, "maxPlatforms": 7}
+            if endpoint.get("path") != "/v1/prism/creator-card" or any(type(pricing.get(k)) is not int or pricing[k] != v for k, v in expected.items()):
+                raise SocialQueryError("Invalid creator-card pricing metadata.")
+            raw = parameters.get("platforms", "tiktok,instagram,youtube,twitter")
+            if not isinstance(raw, str): raise SocialQueryError("Invalid creator platforms.")
+            platforms = {p.strip() for p in raw.split(",") if p.strip() in ("tiktok", "instagram", "youtube", "twitter", "threads", "bluesky", "truthsocial")}
+            if not platforms: raise SocialQueryError("Select a supported creator platform.")
+            cost = 5 + max(0, len(platforms) - 4)
+        elif isinstance(pricing, dict) and pricing.get("type") == "comment_lookup_batch":
+            if endpoint.get("path") != "/v1/prism/comment-lookup" or type(pricing.get("maxItems")) is not int or pricing["maxItems"] != 25 or type(pricing.get("maxCredits")) is not int or pricing["maxCredits"] != 100:
+                raise SocialQueryError("Invalid comment batch pricing metadata.")
+            # The server resolves valid items and enforces the explicit caller cap before debit.
+            resolved_pricing, cost = True, 100
         elif isinstance(pricing, dict) and pricing.get("type") == "news_legs":
             expected={"baseCredits":2,"googleCreditsPerLeg":1,"bingArticlesPerCredit":5,"maxLegs":12}
             if endpoint.get("path")!="/v1/search/news" or any(type(pricing.get(k)) is not int or pricing[k]!=v for k,v in expected.items()):
@@ -170,6 +351,48 @@ class SocialQueryClient:
                 except ValueError:
                     host = ""
                 cost += 2 if host == "instagram.com" else 5 if host == "linkedin.com" else 1
+        elif isinstance(pricing, dict) and pricing.get("type") == "job_batch":
+            if endpoint.get("path") != "/v1/prism/jobs" or endpoint.get("method") != "POST" or pricing.get("maxItems") != 5000 or pricing.get("defaultCredits") != 1 or pricing.get("profileCredits") != {"linkedin": 5} or pricing.get("postCredits") != {"instagram": 2, "linkedin": 5}:
+                raise SocialQueryError("Invalid job pricing metadata.")
+            target = parameters.get("endpoint")
+            if target not in ("prism/profiles", "prism/post-stats") or set(parameters) - {"endpoint", "items", "webhook"}:
+                raise SocialQueryError("Unsupported job endpoint or options.")
+            if "webhook" in parameters:
+                _job_webhook(parameters["webhook"])
+            items = parameters.get("items")
+            if not isinstance(items, list) or not 1 <= len(items) <= 5000:
+                raise SocialQueryError("Jobs require an array of 1–5,000 items.")
+            cost = 0
+            for item in items:
+                if not isinstance(item, dict) or "custom_id" in item and (not isinstance(item["custom_id"], str) or len(item["custom_id"]) > 200):
+                    raise SocialQueryError("Invalid job item.")
+                if target == "prism/profiles":
+                    if set(item) - {"platform", "handle", "custom_id"} or not isinstance(item.get("platform"), str) or not isinstance(item.get("handle"), str) or not item["handle"].strip():
+                        raise SocialQueryError("Invalid job profile.")
+                    cost += 5 if item["platform"] == "linkedin" else 1
+                else:
+                    if set(item) - {"url", "custom_id"} or not isinstance(item.get("url"), str) or len(item["url"]) > 2048:
+                        raise SocialQueryError("Invalid job URL.")
+                    try:
+                        parsed = urllib.parse.urlsplit(item["url"])
+                        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.port:
+                            raise ValueError()
+                        host = parsed.hostname.lower().removeprefix("www.")
+                    except ValueError:
+                        raise SocialQueryError("Use a public HTTPS post URL.")
+                    cost += 2 if host == "instagram.com" else 5 if host == "linkedin.com" else 1
+        elif isinstance(pricing, dict) and pricing.get("type") == "linkedin_profile_urls":
+            if endpoint.get("path") != "/v1/linkedin/profile/all" or type(pricing.get("maxItems")) is not int or pricing["maxItems"] != 10 or type(pricing.get("creditsPerProfile")) is not int or pricing["creditsPerProfile"] != 5:
+                raise SocialQueryError("Invalid LinkedIn profile pricing metadata.")
+            if ("url" in parameters) == ("urls" in parameters):
+                raise SocialQueryError("Supply exactly one of url or urls.")
+            raw = parameters.get("urls") if "urls" in parameters else parameters.get("url")
+            if not isinstance(raw, str) or len(raw) > 16000 or re.search(r"[\x00-\x20\x7f]", raw):
+                raise SocialQueryError("Invalid LinkedIn profile URLs.")
+            inputs = raw.split(",") if "urls" in parameters else [raw]
+            if not 1 <= len(inputs) <= 10:
+                raise SocialQueryError("Supply one to ten canonical HTTPS LinkedIn profile URLs.")
+            cost = len({_linkedin_profile_url(value) for value in inputs}) * 5
         elif isinstance(pricing, dict) and pricing.get("type") == "profile_batch":
             if endpoint.get("path") != "/v1/prism/profiles" or pricing.get("maxItems") != 50 or pricing.get("defaultCredits") != 1 or pricing.get("platformCredits") != {"linkedin": 5}:
                 raise SocialQueryError("Invalid profile pricing metadata.")

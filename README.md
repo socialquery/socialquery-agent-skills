@@ -12,7 +12,7 @@ Or copy `skills/socialquery-data` into your project's `.agents/skills/` director
 
 ## Use
 
-Connect [SocialQuery MCP](https://github.com/ricciflow-api/socialquery-mcp) at `https://socialquery-mcp.vercel.app/mcp` using Streamable HTTP and an `Authorization: Bearer <API key>` header, or use the standard-library Python helper (Python 3.9+):
+Connect [SocialQuery MCP](https://github.com/ricciflow-api/socialquery-mcp) at `https://socialquery.dev/mcp` using Streamable HTTP and an `Authorization: Bearer <API key>` header, or use the standard-library Python helper (Python 3.9+):
 
 ```bash
 python3 skills/socialquery-data/scripts/socialquery_api.py discover --platform hackernews

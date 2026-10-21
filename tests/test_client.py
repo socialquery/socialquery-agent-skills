@@ -137,9 +137,10 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(module.SocialQueryError):client.call_endpoint(item["id"],{**custom,"include":"details"},11)
         client.call_endpoint(item["id"],{**custom,"include":"details"},12)
         before=sum(item["path"] in r.full_url for r in opener.requests)
-        for patch in [{"relevance":"bad"},{"relevance_threshold":True},{"relevance_threshold":2},{"relevance_threshold":"1e-1"},{"relevance_threshold":"0.1234567"},{"relevant_to":""},{"relevant_to":False},{"relevant_to":"x\ny"},{"relevant_to":"x"*201},{"judgments":"off"},{"label":"none"}]:
+        for patch in [{"relevance":"bad"},{"relevance_threshold":True},{"relevance_threshold":2},{"relevance_threshold":"1e-1"},{"relevance_threshold":"0.1234567"},{"relevant_to":""},{"relevant_to":False},{"relevant_to":"x\ny"},{"relevant_to":"x"*201}]:
             with self.assertRaises(module.SocialQueryError):client.call_endpoint(item["id"],{**custom,**patch},12)
         self.assertEqual(sum(item["path"] in r.full_url for r in opener.requests),before)
+        for patch in [{"judgments":"off"},{"label":"none"}]:client.call_endpoint(item["id"],{**custom,**patch},2)
         client.call_endpoint(item["id"],{"query":"Python","judgments":"off"},1)
         for patch in [{"maxRelevanceCredits":True},{"relevanceRowsPerCredit":10},{"maxCredits":11}]:
             with self.assertRaises(module.SocialQueryError):module.SocialQueryClient(api_key="test",opener=Opener({**item,"creditPricing":{**pricing,**patch}})).call_endpoint(item["id"],{"query":"Python"},12)

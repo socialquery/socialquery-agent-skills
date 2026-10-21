@@ -233,8 +233,7 @@ class SocialQueryClient:
                 raise SocialQueryError("Group relevance requires refreshed pricing metadata.")
             if "judgments" in parameters and parameters["judgments"] not in ("on", "off") or "label" in parameters and parameters["label"] != "none" or "relevance" in parameters and parameters["relevance"] not in ("score", "filter"):
                 raise SocialQueryError("Invalid group relevance controls.")
-            off = parameters.get("judgments") == "off" or parameters.get("label") == "none"
-            if off and "relevance" in parameters or parameters.get("label") == "none" and parameters.get("judgments") == "on" or ("relevance_threshold" in parameters or "relevant_to" in parameters) and "relevance" not in parameters:
+            if ("relevance_threshold" in parameters or "relevant_to" in parameters) and "relevance" not in parameters:
                 raise SocialQueryError("Invalid group relevance controls.")
             threshold = parameters.get("relevance_threshold")
             if "relevance_threshold" in parameters and (type(threshold) not in (str, int, float) or not re.fullmatch(r"(?:0(?:\.\d{1,6})?|1(?:\.0{1,6})?)", str(threshold))):
@@ -244,7 +243,18 @@ class SocialQueryClient:
                 raise SocialQueryError("Invalid group relevance topic.")
             if "dry_run" in parameters and (pricing.get("dryRunSupported") is not True or type(parameters["dry_run"]) not in (str, int) or str(parameters["dry_run"]) != "1"):
                 raise SocialQueryError("dry_run=1 requires preview-capable pricing metadata.")
-            cost = 0 if "dry_run" in parameters else (11 if parameters.get("include") == "details" else 1) + (1 if "relevant_to" in parameters else 0)
+            if "fit" in parameters:
+                goal = parameters.get("goal")
+                if pricing.get("fitSupported") is not True or parameters["fit"] != "goal" or not isinstance(goal, str) or not goal.strip() or len(goal.strip().encode("utf-16-le")) // 2 > 300 or re.search(r"[\x00-\x1f\x7f]", goal):
+                    raise SocialQueryError("fit=goal requires a 1–300 character goal and fit-capable metadata.")
+                tokens = parameters.get("fit_tokens")
+                if "fit_tokens" in parameters and (type(tokens) not in (str, int) or not re.fullmatch(r"[1-9][0-9]{0,4}", str(tokens)) or int(tokens) > 16000):
+                    raise SocialQueryError("fit_tokens must be1–16000.")
+            elif "goal" in parameters or "fit_tokens" in parameters:
+                raise SocialQueryError("goal/fit_tokens require fit=goal.")
+            if "recall_id" in parameters and (pricing.get("recallSupported") is not True or not isinstance(parameters["recall_id"], str) or not re.fullmatch(r"fbfr1_[A-Za-z0-9_-]{30,1800}\.[A-Za-z0-9_-]{43}", parameters["recall_id"]) or any(k not in ("query", "recall_id") for k in parameters)):
+                raise SocialQueryError("Recall accepts only query and the returned recall_id.")
+            cost = 0 if "dry_run" in parameters or "recall_id" in parameters else (11 if parameters.get("include") == "details" else 1) + (1 if "relevant_to" in parameters else 0)
         elif isinstance(pricing, dict) and pricing.get("type") == "comment_leads":
             expected = {"defaultPosts": 30, "maxPosts": 90, "defaultOpen": 12, "maxOpen": 20, "defaultComments": 50, "maxComments": 200, "postsPerPage": 30, "commentsPerPage": 50, "labelsPerCredit": 25, "maxCredits": 243}
             if endpoint.get("path") != "/v1/prism/comment-leads" or any(type(pricing.get(k)) is not int or pricing[k] != v for k, v in expected.items()):

@@ -126,6 +126,40 @@ class ClientTests(unittest.TestCase):
         for patch in [{"baseCredits":0},{"creditsPerGroup":2},{"maxGroups":11},{"maxCredits":1}]:
             with self.assertRaises(module.SocialQueryError):module.SocialQueryClient(api_key="test",opener=Opener({**item,"creditPricing":{**pricing,**patch}})).call_endpoint(item["id"],{"query":"Python"},11)
 
+    def test_facebook_group_relevance_hold(self):
+        pricing={"type":"group_search","baseCredits":1,"creditsPerGroup":1,"maxGroups":10,"maxCredits":12,"maxRelevanceCredits":1,"relevanceRowsPerCredit":25}
+        item={**ENDPOINT,"path":"/v1/facebook/search/groups","creditPricing":pricing,"params":[{"name":n,"required":n=="query"} for n in ["query","include","page","cursor","relevance","relevance_threshold","relevant_to","judgments","label"]]}
+        opener=Opener(item);client=module.SocialQueryClient(api_key="test",opener=opener)
+        custom={"query":"Python","relevance":"filter","relevant_to":"Python programming","relevance_threshold":0.5}
+        with self.assertRaises(module.SocialQueryError):client.call_endpoint(item["id"],custom,1)
+        client.call_endpoint(item["id"],custom,2)
+        self.assertEqual(opener.requests[-1].get_header("X-max-credits"),"2")
+        with self.assertRaises(module.SocialQueryError):client.call_endpoint(item["id"],{**custom,"include":"details"},11)
+        client.call_endpoint(item["id"],{**custom,"include":"details"},12)
+        before=sum(item["path"] in r.full_url for r in opener.requests)
+        for patch in [{"relevance":"bad"},{"relevance_threshold":True},{"relevance_threshold":2},{"relevance_threshold":"1e-1"},{"relevance_threshold":"0.1234567"},{"relevant_to":""},{"relevant_to":False},{"relevant_to":"x\ny"},{"relevant_to":"x"*201},{"judgments":"off"},{"label":"none"}]:
+            with self.assertRaises(module.SocialQueryError):client.call_endpoint(item["id"],{**custom,**patch},12)
+        self.assertEqual(sum(item["path"] in r.full_url for r in opener.requests),before)
+        client.call_endpoint(item["id"],{"query":"Python","judgments":"off"},1)
+        for patch in [{"maxRelevanceCredits":True},{"relevanceRowsPerCredit":10},{"maxCredits":11}]:
+            with self.assertRaises(module.SocialQueryError):module.SocialQueryClient(api_key="test",opener=Opener({**item,"creditPricing":{**pricing,**patch}})).call_endpoint(item["id"],{"query":"Python"},12)
+
+    def test_facebook_group_preview(self):
+        pricing={"type":"group_search","baseCredits":1,"creditsPerGroup":1,"maxGroups":10,"maxCredits":12,"maxRelevanceCredits":1,"relevanceRowsPerCredit":25,"dryRunSupported":True}
+        item={**ENDPOINT,"path":"/v1/facebook/search/groups","creditPricing":pricing,"params":[{"name":n,"required":n=="query"} for n in ["query","include","page","cursor","relevance","relevance_threshold","relevant_to","judgments","label","dry_run"]]}
+        opener=Opener(item);client=module.SocialQueryClient(api_key="test",opener=opener)
+        parameters={"query":"Python","dry_run":"1","include":"details","relevance":"filter","relevant_to":"Python programming"}
+        client.call_endpoint(item["id"],parameters,0)
+        self.assertEqual(opener.requests[-1].get_header("X-max-credits"),"0")
+        before=sum(item["path"] in r.full_url for r in opener.requests)
+        for invalid in [0,"0",True,False,"true","",2,"01",None]:
+            with self.assertRaises(module.SocialQueryError):client.call_endpoint(item["id"],{**parameters,"dry_run":invalid},0)
+        self.assertEqual(sum(item["path"] in r.full_url for r in opener.requests),before)
+        for marker in [False,1]:
+            with self.assertRaises(module.SocialQueryError):module.SocialQueryClient(api_key="test",opener=Opener({**item,"creditPricing":{**pricing,"dryRunSupported":marker}})).call_endpoint(item["id"],parameters,0)
+        older={k:v for k,v in pricing.items() if k!="dryRunSupported"}
+        with self.assertRaises(module.SocialQueryError):module.SocialQueryClient(api_key="test",opener=Opener({**item,"creditPricing":older})).call_endpoint(item["id"],parameters,0)
+
     def test_comment_leads_hold(self):
         pricing={"type":"comment_leads","defaultPosts":30,"maxPosts":90,"defaultOpen":12,"maxOpen":20,"defaultComments":50,"maxComments":200,"postsPerPage":30,"commentsPerPage":50,"labelsPerCredit":25,"maxCredits":243}
         item={**ENDPOINT,"path":"/v1/prism/comment-leads","creditCost":0,"params":[{"name":n,"required":n=="query"} for n in ["query","offer","posts","open","comments_per_post","platform","include"]],"creditPricing":pricing}
@@ -268,7 +302,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(opener.requests[-1].get_header("X-max-credits"),"9")
 
     def test_background_job_reservation(self):
-        item={**ENDPOINT,"method":"POST","path":"/v1/prism/jobs","params":[{"name":"endpoint","required":True},{"name":"items","required":True}],"creditPricing":{"type":"job_batch","maxItems":5000,"defaultCredits":1,"profileCredits":{"linkedin":5},"postCredits":{"instagram":2,"linkedin":5}}}
+        item={**ENDPOINT,"method":"POST","path":"/v1/prism/jobs","params":[{"name":"endpoint","required":True},{"name":"items","required":True},{"name":"include"},{"name":"since"}],"creditPricing":{"type":"job_batch","maxItems":5000,"defaultCredits":1,"profileCredits":{"linkedin":5},"postCredits":{"instagram":2,"linkedin":5}}}
         opener=Opener(item);client=module.SocialQueryClient(api_key="test",opener=opener)
         params={"endpoint":"prism/profiles","items":[{"platform":"instagram","handle":"sample"},{"platform":"linkedin","handle":"sample"}]}
         with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],params,5,"underfunded",True)
@@ -276,7 +310,14 @@ class ClientTests(unittest.TestCase):
         client.call_endpoint(item["id"],params,6,"batch-job-01",True)
         self.assertEqual(json.loads(opener.requests[-1].data),params)
         self.assertEqual(opener.requests[-1].get_header("X-max-credits"),"6")
-        with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],{**params,"include":"posts"},100,"unsupported",True)
+        with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],{**params,"include":"comments"},100,"unsupported",True)
+
+        enriched={**params,"include":"posts","since":"2026-10-01","items":[{**params["items"][0],"stop_at_id":"known"},params["items"][1]]}
+        with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],enriched,6,"underfunded-posts",True)
+        client.call_endpoint(item["id"],enriched,7,"enriched-job",True)
+        self.assertEqual(json.loads(opener.requests[-1].data),enriched)
+        for since in ["2026-02-30","2026-01-01T24:00:00Z","2026-01-01T00:00:00+01:60"]:
+            with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],{**enriched,"since":since},7,"invalid-date",True)
 
     def test_profile_batch_tiers_and_nested_items(self):
         item={**ENDPOINT,"method":"POST","path":"/v1/prism/profiles","params":[{"name":"items","required":True}],"creditPricing":{"type":"profile_batch","maxItems":50,"defaultCredits":1,"platformCredits":{"linkedin":5}}}
@@ -300,6 +341,26 @@ class ClientTests(unittest.TestCase):
         client.call_endpoint(item["id"],{"handle":"alice","limit":80},5)
         for patch in ({"limit":None},{"limit":True},{"limit":0},{"limit":81},{"include":"other"}):
             with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],{**params,**patch},85)
+
+    def test_company_people_profile_hydration_pricing(self):
+        item={**ENDPOINT,"path":"/v1/linkedin/company/people","creditCost":10,"params":[{"name":"company_id"},{"name":"include"},{"name":"limit"}],"creditPricing":{"type":"profile_hydration","baseCredits":10,"creditsPerProfile":4,"defaultLimit":10,"maxLimit":10}}
+        opener=Opener(item);client=module.SocialQueryClient(api_key="test",opener=opener)
+        params={"company_id":"1035","include":"profile","limit":3}
+        with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],params,21)
+        self.assertEqual(len(opener.requests),1)
+        client.call_endpoint(item["id"],params,22)
+        self.assertEqual(opener.requests[-1].get_header("X-max-credits"),"22")
+        client.call_endpoint(item["id"],{"company_id":"1035","include":"profile"},50)
+        client.call_endpoint(item["id"],{"company_id":"1035"},10)
+        for patch in ({"limit":None},{"limit":True},{"limit":0},{"limit":11},{"include":"other"}):
+            with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],{**params,**patch},50)
+
+    def test_company_people_rejects_legacy_underquote(self):
+        item={**ENDPOINT,"path":"/v1/linkedin/company/people","creditCost":10,"params":[{"name":"company_id"},{"name":"include"}]}
+        item.pop("creditPricing",None)
+        opener=Opener(item);client=module.SocialQueryClient(api_key="test",opener=opener)
+        with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"],{"company_id":"1035","include":"profile"},50)
+        self.assertEqual(len(opener.requests),1)
 
     def test_org_radar_pricing(self):
         item={**ENDPOINT,"path":"/v1/prism/org-radar","creditCost":26,"params":[{"name":"org","required":True},{"name":"repos"},{"name":"include"}],"creditPricing":{"type":"org_repositories","baseCredits":1,"creditsPerRepo":5,"defaultRepos":5,"maxRepos":10}}

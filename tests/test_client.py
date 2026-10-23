@@ -18,6 +18,52 @@ class Opener:
         return io.BytesIO(json.dumps({"success":True,"credits_used":0,"data":{"endpoints":[self.endpoint]}}).encode())
 
 class ClientTests(unittest.TestCase):
+    def test_korea_global_query_is_literal_and_requires_social(self):
+        endpoint = {**ENDPOINT, "path": "/v1/prism/korea-gap", "creditCost": 40, "creditPricing": {"type": "korea_gap", "defaultCredits": 40, "webOnlyCredits": 15}, "params": [{"name": "query", "required": True}, {"name": "global_query"}, {"name": "include"}]}
+        opener = Opener(endpoint)
+        client = module.SocialQueryClient("sq_test", opener=opener)
+        client.call_endpoint(endpoint["id"], {"query": "브랜드", "global_query": "Public brand"}, 40)
+        self.assertIn("global_query=Public+brand", opener.requests[-1].full_url)
+        before = len([r for r in opener.requests if "/v1/prism/korea-gap?" in r.full_url])
+        for patch in ({"global_query": ""}, {"global_query": "x\ny"}, {"global_query": "x"*501}, {"global_query": True}, {"global_query": "brand", "include": "quotes"}):
+            with self.assertRaises(module.SocialQueryError): client.call_endpoint(endpoint["id"], {"query": "브랜드", **patch}, 40)
+        self.assertEqual(len([r for r in opener.requests if "/v1/prism/korea-gap?" in r.full_url]), before)
+
+    def test_connection_walk_page_quotes_and_stale_metadata(self):
+        for path in ("/v1/instagram/followers", "/v1/instagram/following"):
+            pricing = {"type": "per_item", "creditsPerItem": 5, "limitParameter": "max_pages", "defaultLimit": 1, "maxLimit": 5}
+            item = {**ENDPOINT, "path": path, "creditCost": 5, "creditPricing": pricing, "params": [{"name": "handle"}, {"name": "coverage"}, {"name": "max_pages"}]}
+            for pages in (1, 2, 5):
+                opener = Opener(item)
+                client = module.SocialQueryClient("sq_test", opener=opener)
+                parameters = {"handle": "example", "coverage": "full", "max_pages": pages}
+                with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"], parameters, pages*5-1)
+                self.assertFalse(any(path in r.full_url for r in opener.requests))
+                client.call_endpoint(item["id"], parameters, pages*5)
+                self.assertEqual(opener.requests[-1].get_header("X-max-credits"), str(pages*5))
+            for metadata in (None, {**pricing, "creditsPerItem": 1}, {**pricing, "maxLimit": True}):
+                opener = Opener({**item, "creditPricing": metadata})
+                with self.assertRaises(module.SocialQueryError): module.SocialQueryClient("sq_test", opener=opener).call_endpoint(item["id"], {"handle": "example", "coverage": "full", "max_pages": 2}, 25)
+                self.assertFalse(any(path in r.full_url for r in opener.requests))
+
+    def test_linkedin_discovery_profile_quotes_and_stale_metadata(self):
+        for path in ("/v1/linkedin/post/reactions", "/v1/linkedin/post/reposts", "/v1/linkedin/search/people/by-url", "/v1/linkedin/search/people"):
+            base = 5 if path.endswith("/reposts") else 10
+            pricing = {"type": "profile_hydration", "baseCredits": base, "creditsPerProfile": 4, "defaultLimit": 10, "maxLimit": 10}
+            item = {**ENDPOINT, "path": path, "creditCost": base, "creditPricing": pricing, "params": [{"name": "url", "required": True}, {"name": "include"}, {"name": "limit"}]}
+            opener = Opener(item)
+            client = module.SocialQueryClient("sq_test", opener=opener)
+            for parameters, maximum in [({"url": "https://example.invalid"}, base), ({"url": "https://example.invalid", "include": "profile"}, base+40), ({"url": "https://example.invalid", "include": "profile", "limit": 1}, base+4)]:
+                before = sum(path in r.full_url for r in opener.requests)
+                with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"], parameters, maximum-1)
+                self.assertEqual(sum(path in r.full_url for r in opener.requests), before)
+                client.call_endpoint(item["id"], parameters, maximum)
+                self.assertEqual(opener.requests[-1].get_header("X-max-credits"), str(maximum))
+            for metadata in [None, {**pricing, "baseCredits": 0}, {**pricing, "creditsPerProfile": 1}, {**pricing, "maxLimit": True}]:
+                invalid = Opener({**item, "creditPricing": metadata})
+                with self.assertRaises(module.SocialQueryError): module.SocialQueryClient("sq_test", opener=invalid).call_endpoint(item["id"], {"url": "https://example.invalid", "include": "profile"}, 50)
+                self.assertFalse(any(path in r.full_url for r in invalid.requests))
+
     def test_bing_snapshot_continuation_quotes_zero(self):
         item={**ENDPOINT,"path":"/v1/jobs/bing/search","creditCost":10,"params":[{"name":"query"},{"name":"location"},{"name":"cursor"}],"oneOfParameters":[["query","cursor"],["location","cursor"]]}
         opener=Opener(item); client=module.SocialQueryClient("sq_test",opener=opener)
@@ -269,6 +315,21 @@ class ClientTests(unittest.TestCase):
         opener=Opener(batch);client=module.SocialQueryClient(api_key="test",opener=opener)
         client.call_endpoint(batch["id"],{"items":[{"comment_url":"https://www.instagram.com/p/example/c/123456/"}]},5,idempotency_key="batch-test",allow_mutation=True)
         self.assertEqual(opener.requests[-1].get_header("X-max-credits"),"5")
+
+    def test_handle_audit_platform_pricing(self):
+        item = {**ENDPOINT, "path": "/v1/prism/handle-audit", "creditCost": 5, "params": [{"name": "handle", "required": True}, {"name": "platforms"}], "creditPricing": {"type": "creator_card", "baseCredits": 5, "includedPlatforms": 4, "extraPlatformCredits": 1, "maxPlatforms": 7}}
+        opener = Opener(item)
+        client = module.SocialQueryClient(api_key="test", opener=opener)
+        params = {"handle": "sample", "platforms": "tiktok,instagram,youtube,twitter,threads,bluesky,truthsocial"}
+        with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"], params, 7)
+        client.call_endpoint(item["id"], params, 8)
+        self.assertEqual(opener.requests[-1].get_header("X-max-credits"), "8")
+        count = len(opener.requests)
+        for platforms in ("youtube,youtube", "reddit", "youtube, instagram"):
+            with self.assertRaises(module.SocialQueryError): client.call_endpoint(item["id"], {"handle": "sample", "platforms": platforms}, 8)
+        self.assertEqual(len(opener.requests), count + 3)
+        stale = {k: v for k, v in item.items() if k != "creditPricing"}
+        with self.assertRaises(module.SocialQueryError): module.SocialQueryClient(api_key="test", opener=Opener(stale)).call_endpoint(item["id"], {"handle": "sample"}, 8)
 
     def test_video_board_fixed_overhead_and_limit(self):
         item={**ENDPOINT,"path":"/v1/tiktok/videos/popular","creditCost":26,"params":[{"name":"limit"}],"creditPricing":{"type":"board_plus_item","baseCredits":25,"creditsPerItem":1,"defaultLimit":20,"maxLimit":20}}
